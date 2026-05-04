@@ -17,12 +17,24 @@ from prompt import *
 import time
 import asyncio
 
-from tool_file import *
 from tool_scholar import *
-from tool_python import *
 from tool_search import *
 from tool_visit import *
 from tool_clinical import *
+
+OPTIONAL_TOOL_IMPORT_ERRORS = {}
+
+try:
+    from tool_file import FileParser
+except Exception as e:
+    FileParser = None
+    OPTIONAL_TOOL_IMPORT_ERRORS["parse_file"] = str(e)
+
+try:
+    from tool_python import PythonInterpreter
+except Exception as e:
+    PythonInterpreter = None
+    OPTIONAL_TOOL_IMPORT_ERRORS["PythonInterpreter"] = str(e)
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -30,16 +42,18 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 TOOL_CLASS = [
-    FileParser(),
     Scholar(),
     Visit(),
     Search(),
-    PythonInterpreter(),
     ClinicalTrialsSearch(),
     LiteratureSearch(),
     ExtractWebpage(),
     GrobidPDFParser(),
 ]
+if FileParser is not None:
+    TOOL_CLASS.append(FileParser())
+if PythonInterpreter is not None:
+    TOOL_CLASS.append(PythonInterpreter())
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
 import random
@@ -100,11 +114,14 @@ class MultiTurnReactAgent(FnCallAgent):
         request_kwargs = {
             "model": model_name,
             "messages": msgs,
-            "temperature": self.llm_generate_cfg.get('temperature', 0.6),
-            "top_p": self.llm_generate_cfg.get('top_p', 0.95),
             token_param: int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "10000")),
-            "presence_penalty": self.llm_generate_cfg.get('presence_penalty', 1.1),
         }
+        if not self._env_truthy("LLM_OMIT_SAMPLING_PARAMS"):
+            request_kwargs.update({
+                "temperature": self.llm_generate_cfg.get('temperature', 0.6),
+                "top_p": self.llm_generate_cfg.get('top_p', 0.95),
+                "presence_penalty": self.llm_generate_cfg.get('presence_penalty', 1.1),
+            })
         if not self._env_truthy("LLM_DISABLE_STOP"):
             request_kwargs["stop"] = ["\n<tool_response>", "<tool_response>"]
         if self._env_truthy("LLM_ENABLE_LOGPROBS") and provider == "vllm":

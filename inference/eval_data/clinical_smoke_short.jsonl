@@ -1,0 +1,1 @@
+{"question": "Use the clinical_trials_search tool with query \"gene therapy rare disease\" and max_results 1. Then answer with one NCT ID, status, disease focus, and primary outcome pattern. Keep the final answer under 120 words.", "answer": ""}

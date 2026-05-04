@@ -12,6 +12,8 @@ AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
 AZURE_OPENAI_API_KEY=...
 AZURE_OPENAI_API_VERSION=2024-10-21
 AZURE_OPENAI_DEPLOYMENT=your_deployment_name
+LLM_MAX_TOKEN_PARAM=max_completion_tokens
+LLM_OMIT_SAMPLING_PARAMS=true
 ```
 
 When `LLM_PROVIDER=azure`, you can run `inference/run_multi_react.py` directly. The original `inference/run_react_infer.sh` still starts local vLLM servers and is only needed for `LLM_PROVIDER=vllm`.

@@ -10,6 +10,12 @@ from react_agent import MultiTurnReactAgent
 import time
 import math
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except Exception:
+    pass
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="")
