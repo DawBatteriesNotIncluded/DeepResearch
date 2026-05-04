@@ -166,7 +166,16 @@ if __name__ == "__main__":
 
         test_agent = MultiTurnReactAgent(
             llm=llm_cfg,
-            function_list=["search", "visit", "google_scholar", "PythonInterpreter"]
+            function_list=[
+                "search",
+                "visit",
+                "google_scholar",
+                "PythonInterpreter",
+                "clinical_trials_search",
+                "literature_search",
+                "extract_webpage",
+                "parse_pdf_grobid",
+            ]
         )
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}

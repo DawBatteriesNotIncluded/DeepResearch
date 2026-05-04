@@ -183,6 +183,10 @@ You need to modify the following in the file [inference/react_agent.py](https://
 
 We provide benchmark evaluation scripts for various datasets. Please refer to the [evaluation scripts](./evaluation/) directory for more details.
 
+## Clinical Research Agent Extensions
+
+This fork includes an Azure OpenAI backend and clinical ingestion tools for ClinicalTrials.gov, Europe PMC, Trafilatura, Scrapy, Firecrawl, and GROBID. See [CLINICAL_AGENT.md](./CLINICAL_AGENT.md) for setup and usage.
+
 ## FAQ
 
 Please refer to the [FAQ](./FAQ.md) for more details.

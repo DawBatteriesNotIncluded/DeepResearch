@@ -4,7 +4,7 @@ import os
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
-from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+from openai import AzureOpenAI, OpenAI, APIError, APIConnectionError, APITimeoutError
 from transformers import AutoTokenizer 
 from datetime import datetime
 from qwen_agent.agents.fncall_agent import FnCallAgent
@@ -22,6 +22,7 @@ from tool_scholar import *
 from tool_python import *
 from tool_search import *
 from tool_visit import *
+from tool_clinical import *
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -34,6 +35,10 @@ TOOL_CLASS = [
     Visit(),
     Search(),
     PythonInterpreter(),
+    ClinicalTrialsSearch(),
+    LiteratureSearch(),
+    ExtractWebpage(),
+    GrobidPDFParser(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
@@ -52,35 +57,64 @@ class MultiTurnReactAgent(FnCallAgent):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        self._tokenizer = None
+
+    def _llm_provider(self):
+        return os.getenv("LLM_PROVIDER", "vllm").strip().lower()
+
+    @staticmethod
+    def _env_truthy(name, default="false"):
+        return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
-        
-        openai_api_key = "EMPTY"
-        openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
+        provider = self._llm_provider()
+        if provider == "azure":
+            client = AzureOpenAI(
+                api_key=os.environ["AZURE_OPENAI_API_KEY"],
+                azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+                timeout=600.0,
+            )
+            model_name = os.environ["AZURE_OPENAI_DEPLOYMENT"]
+        elif provider == "openai":
+            client = OpenAI(
+                api_key=os.environ["OPENAI_API_KEY"],
+                base_url=os.getenv("OPENAI_API_BASE") or None,
+                timeout=600.0,
+            )
+            model_name = os.getenv("OPENAI_MODEL", self.model)
+        else:
+            openai_api_key = os.getenv("VLLM_API_KEY", "EMPTY")
+            openai_api_base = os.getenv("VLLM_API_BASE", f"http://127.0.0.1:{planning_port}/v1")
+            client = OpenAI(
+                api_key=openai_api_key,
+                base_url=openai_api_base,
+                timeout=600.0,
+            )
+            model_name = self.model
 
-        client = OpenAI(
-            api_key=openai_api_key,
-            base_url=openai_api_base,
-            timeout=600.0,
-        )
+        token_param = os.getenv("LLM_MAX_TOKEN_PARAM", "max_tokens")
+        request_kwargs = {
+            "model": model_name,
+            "messages": msgs,
+            "temperature": self.llm_generate_cfg.get('temperature', 0.6),
+            "top_p": self.llm_generate_cfg.get('top_p', 0.95),
+            token_param: int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "10000")),
+            "presence_penalty": self.llm_generate_cfg.get('presence_penalty', 1.1),
+        }
+        if not self._env_truthy("LLM_DISABLE_STOP"):
+            request_kwargs["stop"] = ["\n<tool_response>", "<tool_response>"]
+        if self._env_truthy("LLM_ENABLE_LOGPROBS") and provider == "vllm":
+            request_kwargs["logprobs"] = True
 
         base_sleep_time = 1 
         for attempt in range(max_tries):
             try:
                 print(f"--- Attempting to call the service, try {attempt + 1}/{max_tries} ---")
-                chat_response = client.chat.completions.create(
-                    model=self.model,
-                    messages=msgs,
-                    stop=["\n<tool_response>", "<tool_response>"],
-                    temperature=self.llm_generate_cfg.get('temperature', 0.6),
-                    top_p=self.llm_generate_cfg.get('top_p', 0.95),
-                    logprobs=True,
-                    max_tokens=10000,
-                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
-                )
+                chat_response = client.chat.completions.create(**request_kwargs)
                 content = chat_response.choices[0].message.content
 
                 # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line 89 - 90.
@@ -110,12 +144,26 @@ class MultiTurnReactAgent(FnCallAgent):
         return f"vllm server error!!!"
 
     def count_tokens(self, messages):
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
-        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-        tokens = tokenizer(full_prompt, return_tensors="pt")
-        token_count = len(tokens["input_ids"][0])
-        
-        return token_count
+        if self._llm_provider() == "vllm" and self.llm_local_path:
+            try:
+                if self._tokenizer is None:
+                    self._tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path)
+                full_prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
+                tokens = self._tokenizer(full_prompt, return_tensors="pt")
+                return len(tokens["input_ids"][0])
+            except Exception as e:
+                print(f"Tokenizer fallback enabled: {e}")
+
+        try:
+            import tiktoken
+            try:
+                encoding = tiktoken.encoding_for_model(os.getenv("TIKTOKEN_MODEL", "gpt-4o"))
+            except Exception:
+                encoding = tiktoken.get_encoding("cl100k_base")
+            # Chat wrappers add a small fixed overhead per message; this is a guardrail estimate.
+            return sum(len(encoding.encode(msg.get("content", ""))) + 4 for msg in messages) + 2
+        except Exception:
+            return sum(len(msg.get("content", "")) // 4 + 4 for msg in messages) + 2
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model=model

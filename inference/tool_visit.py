@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Union
@@ -18,6 +19,28 @@ VISIT_SERVER_TIMEOUT = int(os.getenv("VISIT_SERVER_TIMEOUT", 200))
 WEBCONTENT_MAXLENGTH = int(os.getenv("WEBCONTENT_MAXLENGTH", 150000))
 
 JINA_API_KEYS = os.getenv("JINA_API_KEYS", "")
+
+
+def _load_trafilatura():
+    try:
+        import trafilatura
+        return trafilatura
+    except Exception:
+        repo_path = os.getenv("TRAFILATURA_REPO_PATH")
+        if not repo_path:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            repo_path = os.path.abspath(os.path.join(current_dir, "..", "..", "trafilatura"))
+        if os.path.exists(repo_path):
+            sys.path.insert(0, repo_path)
+            import trafilatura
+            return trafilatura
+    raise ImportError("Install trafilatura or set TRAFILATURA_REPO_PATH.")
+
+
+def _trim_text(text: str, max_chars: int = WEBCONTENT_MAXLENGTH) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n...[truncated {len(text) - max_chars} chars]"
 
 
 @staticmethod
@@ -75,7 +98,7 @@ class Visit(BaseTool):
         os.makedirs(log_folder, exist_ok=True)
 
         if isinstance(url, str):
-            response = self.readpage_jina(url, goal)
+            response = self.readpage(url, goal)
         else:
             response = []
             assert isinstance(url, List)
@@ -87,7 +110,7 @@ class Visit(BaseTool):
                     cur_response += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
                 else:
                     try:
-                        cur_response = self.readpage_jina(u, goal)
+                        cur_response = self.readpage(u, goal)
                     except Exception as e:
                         cur_response = f"Error fetching {u}: {str(e)}"
                 response.append(cur_response)
@@ -95,6 +118,69 @@ class Visit(BaseTool):
         
         print(f'Summary Length {len(response)}; Summary Content {response}')
         return response.strip()
+
+    def readpage(self, url: str, goal: str) -> str:
+        backend = os.getenv("VISIT_BACKEND", "jina").strip().lower()
+        if backend == "trafilatura":
+            return self.readpage_trafilatura(url, goal)
+        if backend == "firecrawl":
+            return self.readpage_firecrawl(url, goal)
+        return self.readpage_jina(url, goal)
+
+    def readpage_trafilatura(self, url: str, goal: str) -> str:
+        try:
+            trafilatura = _load_trafilatura()
+            response = requests.get(
+                url,
+                timeout=VISIT_SERVER_TIMEOUT,
+                headers={"User-Agent": os.getenv("CRAWLER_USER_AGENT", "DeepResearchClinicalBot/0.1")},
+            )
+            response.raise_for_status()
+            extracted = trafilatura.extract(
+                response.text,
+                url=url,
+                include_comments=False,
+                include_links=True,
+                include_tables=True,
+                favor_precision=True,
+            )
+            if not extracted:
+                extracted = ""
+            useful_information = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
+            useful_information += "Evidence in page: \n" + _trim_text(extracted) + "\n\n"
+            useful_information += "Summary: \n" + _trim_text(extracted, 4000) + "\n\n"
+            return useful_information
+        except Exception as e:
+            return f"[visit] Trafilatura extraction failed for {url}: {e}"
+
+    def readpage_firecrawl(self, url: str, goal: str) -> str:
+        base_url = os.getenv("FIRECRAWL_BASE_URL", "http://localhost:3002").rstrip("/")
+        api_key = os.getenv("FIRECRAWL_API_KEY", "")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        try:
+            response = requests.post(
+                f"{base_url}/v2/scrape",
+                headers=headers,
+                json={
+                    "url": url,
+                    "formats": ["markdown"],
+                    "onlyMainContent": True,
+                    "timeout": VISIT_SERVER_TIMEOUT * 1000,
+                },
+                timeout=VISIT_SERVER_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data", payload)
+            markdown = data.get("markdown") or data.get("content") or ""
+            useful_information = "The useful information in {url} for user goal {goal} as follows: \n\n".format(url=url, goal=goal)
+            useful_information += "Evidence in page: \n" + _trim_text(markdown) + "\n\n"
+            useful_information += "Summary: \n" + _trim_text(markdown, 4000) + "\n\n"
+            return useful_information
+        except Exception as e:
+            return f"[visit] Firecrawl scrape failed for {url}: {e}"
         
     def call_server(self, msgs, max_retries=2):
         api_key = os.environ.get("API_KEY")
@@ -253,4 +339,3 @@ class Visit(BaseTool):
             useful_information += "Summary: \n" + "The webpage content could not be processed, and therefore, no information is available." + "\n\n"
             return useful_information
 
-    
