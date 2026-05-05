@@ -2,6 +2,9 @@
 .env
 .history
 
+# IDE state
+.vs/
+
 # Python
 __pycache__/
 *.py[cod]

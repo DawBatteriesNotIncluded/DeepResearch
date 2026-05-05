@@ -116,7 +116,10 @@ class Visit(BaseTool):
                 response.append(cur_response)
             response = "\n=======\n".join(response)
         
-        print(f'Summary Length {len(response)}; Summary Content {response}')
+        if os.getenv("VISIT_DEBUG", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            print(f'Summary Length {len(response)}; Summary Content {response}')
+        else:
+            print(f'Summary Length {len(response)}')
         return response.strip()
 
     def readpage(self, url: str, goal: str) -> str:

@@ -1,6 +1,7 @@
 import json
 import json5
 import os
+import re
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
@@ -84,20 +85,22 @@ class MultiTurnReactAgent(FnCallAgent):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
+        max_tries = int(os.getenv("LLM_MAX_TRIES", str(max_tries)))
+        request_timeout = float(os.getenv("LLM_REQUEST_TIMEOUT", "600"))
         provider = self._llm_provider()
         if provider == "azure":
             client = AzureOpenAI(
                 api_key=os.environ["AZURE_OPENAI_API_KEY"],
                 azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
                 api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
-                timeout=600.0,
+                timeout=request_timeout,
             )
             model_name = os.environ["AZURE_OPENAI_DEPLOYMENT"]
         elif provider == "openai":
             client = OpenAI(
                 api_key=os.environ["OPENAI_API_KEY"],
                 base_url=os.getenv("OPENAI_API_BASE") or None,
-                timeout=600.0,
+                timeout=request_timeout,
             )
             model_name = os.getenv("OPENAI_MODEL", self.model)
         else:
@@ -106,7 +109,7 @@ class MultiTurnReactAgent(FnCallAgent):
             client = OpenAI(
                 api_key=openai_api_key,
                 base_url=openai_api_base,
-                timeout=600.0,
+                timeout=request_timeout,
             )
             model_name = self.model
 
@@ -122,7 +125,8 @@ class MultiTurnReactAgent(FnCallAgent):
                 "top_p": self.llm_generate_cfg.get('top_p', 0.95),
                 "presence_penalty": self.llm_generate_cfg.get('presence_penalty', 1.1),
             })
-        if not self._env_truthy("LLM_DISABLE_STOP"):
+        send_stop = provider == "vllm" or self._env_truthy("LLM_ENABLE_HOSTED_STOP")
+        if send_stop and not self._env_truthy("LLM_DISABLE_STOP"):
             request_kwargs["stop"] = ["\n<tool_response>", "<tool_response>"]
         if self._env_truthy("LLM_ENABLE_LOGPROBS") and provider == "vllm":
             request_kwargs["logprobs"] = True
@@ -184,6 +188,28 @@ class MultiTurnReactAgent(FnCallAgent):
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model=model
+        progress_callback = kwargs.get("progress_callback")
+        require_source_tools = bool(kwargs.get("require_source_tools", False))
+        source_tools = {
+            "search",
+            "visit",
+            "google_scholar",
+            "clinical_trials_search",
+            "literature_search",
+            "extract_webpage",
+            "parse_pdf_grobid",
+            "parse_file",
+        }
+        source_tool_used = False
+
+        def emit_progress(event: str, **payload):
+            if progress_callback is None:
+                return
+            try:
+                progress_callback({"event": event, **payload})
+            except Exception:
+                pass
+
         try:
             question = data['item']['question']
         except: 
@@ -200,6 +226,7 @@ class MultiTurnReactAgent(FnCallAgent):
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
+        emit_progress("agent_started", max_calls=num_llm_calls_available)
         while num_llm_calls_available > 0:
             # Check whether time is reached
             if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
@@ -215,35 +242,64 @@ class MultiTurnReactAgent(FnCallAgent):
                 return result
             round += 1
             num_llm_calls_available -= 1
+            emit_progress("round_started", round=round, remaining_calls=num_llm_calls_available)
             content = self.call_server(messages, planning_port)
             print(f'Round {round}: {content}')
             if '<tool_response>' in content:
                 pos = content.find('<tool_response>')
                 content = content[:pos]
             messages.append({"role": "assistant", "content": content.strip()})
-            if '<tool_call>' in content and '</tool_call>' in content:
-                tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
-                try:
-                    if "python" in tool_call.lower():
-                        try:
-                            code_raw=content.split('<tool_call>')[1].split('</tool_call>')[0].split('<code>')[1].split('</code>')[0].strip()
-                            result = TOOL_MAP['PythonInterpreter'].call(code_raw)
-                        except:
-                            result = "[Python Interpreter Error]: Formatting error."
-
-                    else:
-                        tool_call = json5.loads(tool_call)
-                        tool_name = tool_call.get('name', '')
-                        tool_args = tool_call.get('arguments', {})
-                        result = self.custom_call_tool(tool_name, tool_args)
-
-                except:
-                    result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
-                result = "<tool_response>\n" + result + "\n</tool_response>"
-                # print(result)
+            tool_call_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, flags=re.S)
+            emit_progress(
+                "model_response",
+                round=round,
+                chars=len(content or ""),
+                tool_calls=len(tool_call_blocks),
+                has_answer='<answer>' in content and '</answer>' in content,
+            )
+            if tool_call_blocks:
+                tool_results = []
+                for tool_call in tool_call_blocks:
+                    try:
+                        if "python" in tool_call.lower():
+                            try:
+                                code_raw = tool_call.split('<code>')[1].split('</code>')[0].strip()
+                                result = TOOL_MAP['PythonInterpreter'].call(code_raw)
+                                tool_name = "PythonInterpreter"
+                            except Exception:
+                                tool_name = "PythonInterpreter"
+                                result = "[Python Interpreter Error]: Formatting error."
+                        else:
+                            tool_call = json5.loads(tool_call)
+                            tool_name = tool_call.get('name', '')
+                            tool_args = tool_call.get('arguments', {})
+                            emit_progress("tool_started", round=round, tool=tool_name, arguments=tool_args)
+                            result = self.custom_call_tool(tool_name, tool_args)
+                            if tool_name in source_tools:
+                                source_tool_used = True
+                            emit_progress("tool_finished", round=round, tool=tool_name, chars=len(str(result)))
+                    except Exception:
+                        tool_name = "unknown"
+                        result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
+                        emit_progress("tool_failed", round=round, tool=tool_name, error=result)
+                    tool_results.append(f"[{tool_name}]\n{result}")
+                result = "<tool_response>\n" + "\n\n".join(tool_results) + "\n</tool_response>"
                 messages.append({"role": "user", "content": result})
+                continue
             if '<answer>' in content and '</answer>' in content:
+                if require_source_tools and not source_tool_used:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "You tried to answer before gathering sources. You must call at least one "
+                            "source-gathering tool now, then use the returned evidence before writing "
+                            "the final <answer>."
+                        ),
+                    })
+                    emit_progress("answer_rejected", round=round, reason="no_source_tool_used")
+                    continue
                 termination = 'answer'
+                emit_progress("answer_started", round=round)
                 break
             if num_llm_calls_available <= 0 and '<answer>' not in content:
                 messages[-1]['content'] = 'Sorry, the number of llm calls exceeds the limit.'
@@ -251,6 +307,7 @@ class MultiTurnReactAgent(FnCallAgent):
             max_tokens = 110 * 1024
             token_count = self.count_tokens(messages)
             print(f"round: {round}, token count: {token_count}")
+            emit_progress("token_count", round=round, tokens=token_count)
 
             if token_count > max_tokens:
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
@@ -271,6 +328,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     "prediction": prediction,
                     "termination": termination
                 }
+                emit_progress("agent_finished", termination=termination)
                 return result
 
         if '<answer>' in messages[-1]['content']:
@@ -288,6 +346,7 @@ class MultiTurnReactAgent(FnCallAgent):
             "prediction": prediction,
             "termination": termination
         }
+        emit_progress("agent_finished", termination=termination)
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
